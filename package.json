@@ -1,0 +1,17 @@
+{
+  "name": "yemot-youtube-line-v13-0",
+  "version": "13.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "fluent-ffmpeg": "^2.1.3",
+    "ffmpeg-static": "^5.2.0",
+    "@distube/ytdl-core": "^4.14.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
