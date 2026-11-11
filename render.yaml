@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: yemot-youtube-netfri
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: YTDL_NO_UPDATE
+        value: "1"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: YOUTUBE_API_KEY
+        sync: false
+      - key: YEMOT_TOKEN
+        sync: false
