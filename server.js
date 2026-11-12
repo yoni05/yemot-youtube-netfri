@@ -16,12 +16,20 @@ const TOKEN = (process.env.YEMOT_TOKEN || '').trim();
 const GEMINI_KEY = (process.env.GEMINI_API_KEY || '').trim();
 const YT_KEY = (process.env.YOUTUBE_API_KEY || '').trim();
 const YM = 'https://www.call2all.co.il/ym/api/';
-const ADMIN_LOG_EXT = '8'; // שלוחה 8 ליומן מעקב למנהל המערכת
+const ADMIN_LOG_EXT = '8';
 
 let cachedModelName = null;
 const folderCounters = {};
 const userNamesCache = new Map();
 const configuredPlayfileDirs = new Set();
+
+// חילוץ הערך האחרון אם ימות המשיח שולחת מערך של פרמטרים (כמו ["3","3"])
+function lastVal(param) {
+    if (Array.isArray(param)) {
+        return String(param[param.length - 1] || '').trim();
+    }
+    return String(param || '').trim();
+}
 
 async function fetchWithTimeout(url, options = {}, timeout = 20000) {
     const controller = new AbortController();
@@ -36,7 +44,7 @@ async function fetchWithTimeout(url, options = {}, timeout = 20000) {
     }
 }
 
-// בדיקת סטטוס סרטון מול נטפרי (מחזירה true אך ורק אם הסרטון פתוח בנטפרי)
+// בדיקת סטטוס סרטון מול נטפרי
 async function isVideoApprovedByNetFree(videoId) {
     try {
         const url = `https://public.netfree.link/api/check-video?v=${encodeURIComponent(videoId)}`;
@@ -56,7 +64,7 @@ async function isVideoApprovedByNetFree(videoId) {
     }
 }
 
-// בדיקה אם משתמש כבר רשום במערכת ושליפת שמו מקובץ name.txt
+// בדיקה אם משתמש כבר רשום במערכת
 async function getUserNameIfRegistered(phone) {
     if (userNamesCache.has(phone)) {
         return userNamesCache.get(phone);
@@ -70,7 +78,8 @@ async function getUserNameIfRegistered(phone) {
             const files = data.files || [];
             const hasNameFile = files.some(f => {
                 const fname = (typeof f === 'string') ? f : (f && (f.name || f.fileName || ''));
-                return String(fname).toLowerCase() === 'name.txt';
+                const low = String(fname).toLowerCase();
+                return low === 'name.txt' || low === 'name.wav';
             });
             if (hasNameFile) {
                 try {
@@ -78,7 +87,7 @@ async function getUserNameIfRegistered(phone) {
                     const dlRes = await fetchWithTimeout(dlUrl, {}, 5000);
                     if (dlRes.ok) {
                         const nameTxt = (await dlRes.text()).trim();
-                        if (nameTxt && !nameTxt.includes('responseStatus')) {
+                        if (nameTxt && !nameTxt.includes('responseStatus') && !nameTxt.includes('EXCEPTION')) {
                             userNamesCache.set(phone, nameTxt);
                             return nameTxt;
                         }
@@ -94,7 +103,7 @@ async function getUserNameIfRegistered(phone) {
     return null;
 }
 
-// הגדרת תיקייה אישית כשלוחת השמעת קבצים (playfile) בימות המשיח
+// הגדרת תיקייה אישית כשלוחת השמעת קבצים רגילה בימות המשיח (מחוץ לשרת)
 async function ensurePlayfileExtension(folderPathStr) {
     const clean = String(folderPathStr).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
     if (configuredPlayfileDirs.has(clean)) return;
@@ -450,19 +459,16 @@ async function downloadStreamFastToLocalFile(streamUrl, targetFilePath, maxBytes
     }
 }
 
-// הורדה ישירה לשלוחה האישית של המאזין (ללא שמירה בשלוחת ה-API הכללית)
-async function downloadAndUploadToUserFolder(videoId, targetUserFolder, title) {
-    const cleanTarget = String(targetUserFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
-    await ensurePlayfileExtension(cleanTarget);
+// הורדה להשמעה מיידית בחיפוש + העברה ברקע לשלוחה האישית (1 או 2) בסדר הפוך כדי שיושמע כסדרו בשלוחת השמעת קבצים רגילה
+async function downloadAndUploadChainedAndArchive(videoId, livePlayFolder, archiveUserFolder, title) {
+    const cleanLive = String(livePlayFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
+    const cleanArchive = String(archiveUserFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
 
-    // שריון 4 מספרי קבצים עוקבים בתיקייה האישית של המשתמש
-    const partNums = await getNextFileNumberStr(cleanTarget, 4);
-    const partPaths = partNums.map(num => `ivr2:/${cleanTarget}/${num}.wav`);
-    const partCmds = partNums.map(num => `f-/${cleanTarget}/${num}`);
+    // שריון 4 חלקים להשמעה המיידית בחיפוש
+    const partNums = await getNextFileNumberStr(cleanLive, 4);
+    const partPaths = partNums.map(num => `ivr2:/${cleanLive}/${num}.wav`);
+    const partCmds = partNums.map(num => `f-/${cleanLive}/${num}`);
     const chainedPlayCommand = partCmds.join('.');
-
-    // שמירת כותרת השיר/השיעור בקובץ טקסט לצד הקובץ הראשון בתיקיית המשתמש
-    uploadTextToExactPath(title, `ivr2:/${cleanTarget}/${partNums[0]}.txt`, `${partNums[0]}.txt`).catch(() => null);
 
     const streamUrls = await getFastStreamUrls(videoId);
     let workingUrl = null;
@@ -472,7 +478,7 @@ async function downloadAndUploadToUserFolder(videoId, targetUserFolder, title) {
     try {
         for (const sUrl of streamUrls.slice(0, 6)) {
             try {
-                const bytes = await downloadStreamFastToLocalFile(sUrl, tmpQuickInput, 5.5 * 1024 * 1024, 9000);
+                await downloadStreamFastToLocalFile(sUrl, tmpQuickInput, 5.5 * 1024 * 1024, 9000);
                 await convertSegmentToWavFast(tmpQuickInput, tmpQuickWav, 0, 900);
                 if (fs.existsSync(tmpQuickWav) && fs.statSync(tmpQuickWav).size > 20000) {
                     workingUrl = sUrl;
@@ -504,16 +510,20 @@ async function downloadAndUploadToUserFolder(videoId, targetUserFolder, title) {
             await convertSegmentToWavFast(tmpQuickInput, tmpQuickWav, 0, 900);
         }
 
-        // העלאת החלק הראשון ישירות לתיקייה האישית של המשתמש
+        // העלאת החלק הראשון להשמעה המיידית בחיפוש
         const quickWavBuf = await fs.promises.readFile(tmpQuickWav);
         await uploadWavBufferToExactPath(quickWavBuf, partPaths[0], `${partNums[0]}.wav`, 20000);
 
         fs.promises.unlink(tmpQuickInput).catch(() => null);
         fs.promises.unlink(tmpQuickWav).catch(() => null);
 
-        // הורדת המשך הקובץ (חלקים 2-4) ברקע ישירות לתיקייה האישית של המשתמש
+        // תהליך רקע: הורדת המשך הקובץ + העלאת כל החלקים לשלוחה האישית (1 או 2) בסדר הפוך
         (async () => {
             const tmpFullIn = path.join(os.tmpdir(), `full_in_${videoId}_${Date.now()}.audio`);
+            const allPartsForArchive = [
+                { partNumber: 1, buffer: quickWavBuf }
+            ];
+
             try {
                 let fullBytes = 0;
                 if (workingUrl) {
@@ -552,6 +562,7 @@ async function downloadAndUploadToUserFolder(videoId, targetUserFolder, title) {
                             if (stat.size > 80000) {
                                 const partBuf = await fs.promises.readFile(tmpPartWav);
                                 await uploadWavBufferToExactPath(partBuf, partPaths[seg.index], `${partNums[seg.index]}.wav`, 40000);
+                                allPartsForArchive.push({ partNumber: seg.index + 1, buffer: partBuf });
                             } else {
                                 fs.promises.unlink(tmpPartWav).catch(() => null);
                                 break;
@@ -568,6 +579,24 @@ async function downloadAndUploadToUserFolder(videoId, targetUserFolder, title) {
             } finally {
                 fs.promises.unlink(tmpFullIn).catch(() => null);
             }
+
+            // העלאת כל החלקים לשלוחה האישית (שלוחה 1 או 2) בסדר הפוך כך שיושמעו מהתחלה לסוף בשלוחת השמעת קבצים רגילה
+            try {
+                await ensurePlayfileExtension(cleanArchive);
+                const rawArchNums = await getNextFileNumberStr(cleanArchive, allPartsForArchive.length);
+                const archNums = Array.isArray(rawArchNums) ? rawArchNums : [rawArchNums];
+                const reversedParts = [...allPartsForArchive].reverse();
+
+                for (let i = 0; i < reversedParts.length; i++) {
+                    const partObj = reversedParts[i];
+                    const archNum = archNums[i];
+                    const archTargetPath = `ivr2:/${cleanArchive}/${archNum}.wav`;
+                    await uploadWavBufferToExactPath(partObj.buffer, archTargetPath, `${archNum}.wav`, 40000);
+                }
+                console.log(`[Archive Complete] Uploaded ${reversedParts.length} parts to ivr2:/${cleanArchive}`);
+            } catch (archErr) {
+                console.warn('[Archive Upload Error]:', archErr.message);
+            }
         })();
 
         return chainedPlayCommand;
@@ -579,7 +608,9 @@ async function downloadAndUploadToUserFolder(videoId, targetUserFolder, title) {
     }
 }
 
-app.get('/', (req, res) => { res.send('YouTube Personal Line Server v13.0 (NetFree Verified) OK'); });
+const MAIN_MENU_TEXT = 'לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4 שימו לב כי הקבצים מתעדכנים בשלוחה אחת ושתים רק לאחר כחצי דקה משמיעת הקובץ בחיפוש לפי אורך הקובץ';
+
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v14.0 (Fixed Loop & External Ext 1/2) OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -590,90 +621,34 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     try {
         if (q.hangup === 'yes') return res.send('noop');
 
-        const callerPhone = String(q.ApiPhone || '').replace(/[^0-9]/g, '').trim();
+        const callerPhone = lastVal(q.ApiPhone).replace(/[^0-9]/g, '');
         if (!callerPhone) {
             return res.send('id_list_message=t-שגיאה בזיהוי מספר הטלפון&go_to_folder=/');
         }
 
+        const menuChoice = lastVal(q.MenuChoice);
+        const searchMusic = lastVal(q.SearchMusic);
+        const searchTorah = lastVal(q.SearchTorah);
+        const recordName = lastVal(q.RecordName);
+
         const userFolder = `users/${callerPhone}`;
-        const musicFolder = `${userFolder}/1`; // פלייליסט מוזיקה אישי
-        const torahFolder = `${userFolder}/2`; // שיעורי תורה אישיים
         const tempRecFolder = `users/${callerPhone}/temp`;
+        // שלוחות 1 ו-2 הרגילות בימות המשיח (לכל מאזין תת-תיקייה לפי מספר הטלפון שלו בתוך שלוחה 1 ו-2)
+        const musicExtFolder = `1/${callerPhone}`;
+        const torahExtFolder = `2/${callerPhone}`;
 
-        // --- שלב 1: טיפול בהקלטת שם של משתמש חדש ---
-        if (q.RecordName) {
-            let audioBuf;
-            try {
-                audioBuf = await downloadRecordingFromYemot(q.RecordName, q.ApiExtension);
-            } catch (dlErr) {
-                return res.send('id_list_message=t-שגיאה בקליטת ההקלטה אנא נסו שנית&go_to_folder=/');
-            }
-
-            let rawName = '';
-            try {
-                rawName = await transcribeAudio(audioBuf.toString('base64'));
-            } catch (e) {}
-            const cleanName = rawName.replace(/[^א-תa-zA-Z0-9\s]/g, ' ').trim().replace(/\s+/g, ' ') || 'משתמש רשום';
-
-            // שמירת הקלטת השם והטקסט בתיקיית המשתמש
-            await uploadWavBufferToExactPath(audioBuf, `ivr2:/${userFolder}/name.wav`, 'name.wav');
-            await uploadTextToExactPath(cleanName, `ivr2:/${userFolder}/name.txt`, 'name.txt');
-            userNamesCache.set(callerPhone, cleanName);
-
-            // הגדרת תתי-התיקיות האישיות (1 ו-2) כשלוחות השמעת קבצים
-            await ensurePlayfileExtension(musicFolder);
-            await ensurePlayfileExtension(torahFolder);
-
-            // תיעוד רישום המשתמש החדש בשלוחה 8 למנהל המערכת
-            saveAdminLogToExt8(callerPhone, cleanName, 'רישום למערכת', 'הקלטת שם משתמש', '', 'נרשם בהצלחה');
-
-            // מעבר מיידי לתפריט האישי לאחר הרישום
-            return res.send(`id_list_message=t-שלום ${cleanName} נרשמתם בהצלחה&read=t-לחיפוש מוזיקה הקש 3 לחיפוש שיעורי תורה הקש 4 לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת כל שיעורי התורה שחיפשתם הקישו 2=MenuChoice,no,1,1,7,Digits,no`);
-        }
-
-        // --- שלב 2: בדיקה האם המשתמש רשום בכניסה למערכת ---
-        const registeredName = await getUserNameIfRegistered(callerPhone);
-        if (!registeredName) {
-            return res.send(`read=t-ברוכים הבאים אנא הקליטו את שמכם המלא ובסיום הקישו סולמית=RecordName,no,record,/${tempRecFolder},name_rec,no,7,1`);
-        }
-
-        // --- שלב 3: הצגת התפריט הראשי למשתמש רשום ---
-        if (!q.MenuChoice && !q.SearchMusic && !q.SearchTorah) {
-            return res.send(`read=t-לחיפוש מוזיקה הקש 3 לחיפוש שיעורי תורה הקש 4 לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת כל שיעורי התורה שחיפשתם הקישו 2=MenuChoice,no,1,1,7,Digits,no`);
-        }
-
-        // --- שלב 4: ניתוב לפי בחירת המשתמש בתפריט ---
-        if (q.MenuChoice && !q.SearchMusic && !q.SearchTorah) {
-            if (q.MenuChoice === '1') {
-                await ensurePlayfileExtension(musicFolder);
-                return res.send(`go_to_folder=/${musicFolder}`);
-            }
-            if (q.MenuChoice === '2') {
-                await ensurePlayfileExtension(torahFolder);
-                return res.send(`go_to_folder=/${torahFolder}`);
-            }
-            if (q.MenuChoice === '3') {
-                const recNum = await getNextFileNumberStr(tempRecFolder, 1);
-                return res.send(`read=t-אנא אמרו את שם השיר המבוקש ובסיום הקישו סולמית=SearchMusic,no,record,/${tempRecFolder},${recNum},no,7,1`);
-            }
-            if (q.MenuChoice === '4') {
-                const recNum = await getNextFileNumberStr(tempRecFolder, 1);
-                return res.send(`read=t-אנא אמרו את שם שיעור התורה המבוקש ובסיום הקישו סולמית=SearchTorah,no,record,/${tempRecFolder},${recNum},no,7,1`);
-            }
-            return res.send('id_list_message=t-בחירה שגויה&go_to_folder=/');
-        }
-
-        // --- שלב 5: ביצוע חיפוש (מוזיקה או שיעורי תורה) + אימות מול נטפרי ---
-        if (q.SearchMusic || q.SearchTorah) {
-            const isMusic = Boolean(q.SearchMusic);
-            const recordPath = q.SearchMusic || q.SearchTorah;
-            const targetFolder = isMusic ? musicFolder : torahFolder;
+        // --- עדיפות 1: אם המשתמש כבר הקליט חיפוש מוזיקה או שיעור תורה ---
+        if (searchMusic || searchTorah) {
+            const isMusic = Boolean(searchMusic);
+            const recordPath = searchMusic || searchTorah;
+            const archiveFolder = isMusic ? musicExtFolder : torahExtFolder;
             const categoryFilter = isMusic ? 'מוזיקה חסידית קודש' : 'שיעור תורה';
             const categoryLabel = isMusic ? 'מוזיקה' : 'שיעורי תורה';
+            const registeredName = (await getUserNameIfRegistered(callerPhone)) || 'משתמש רשום';
 
             let audioBuf;
             try {
-                audioBuf = await downloadRecordingFromYemot(recordPath, q.ApiExtension);
+                audioBuf = await downloadRecordingFromYemot(recordPath, lastVal(q.ApiExtension));
             } catch (dlErr) {
                 return res.send('id_list_message=t-שגיאה בהורדת ההקלטה מימות המשיח&go_to_folder=/');
             }
@@ -719,25 +694,82 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
                 }
             }
 
-            // אם הסרטון אינו מאושר בנטפרי -> השמעת ההודעה המבוקשת ותיעוד למנהל
             if (!approvedVideoId) {
                 saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'נחסם - לא מאושר בנטפרי');
                 return res.send('id_list_message=t-הסרטון אינו נמצא יתכן שחיפשתם תוכן שאינו ראוי שימו לב לאחר כמה נסיונות לתוכן כזה תיחסמו מהמערכת&go_to_folder=/');
             }
 
-            // הורדת הקובץ המאושר ישירות לשלוחה האישית של המאזין והשמעתו
+            // הורדה להשמעה מיידית + העברה ברקע לשלוחה 1 או 2 הרגילות בימות המשיח
             try {
-                const chainedPlayCmd = await downloadAndUploadToUserFolder(approvedVideoId, targetFolder, approvedTitle);
-                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, approvedTitle, `הורד בהצלחה לתיקייה ${targetFolder}`);
-                return res.send(`id_list_message=t-משמיע ${approvedTitle}.${chainedPlayCmd}&go_to_folder=/${targetFolder}`);
+                const chainedPlayCmd = await downloadAndUploadChainedAndArchive(approvedVideoId, tempRecFolder, archiveFolder, approvedTitle);
+                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, approvedTitle, `הורד בהצלחה לשלוחה ${archiveFolder}`);
+                return res.send(`id_list_message=t-משמיע ${approvedTitle}.${chainedPlayCmd}&go_to_folder=/`);
             } catch (audioErr) {
                 console.error('[Download Error]', audioErr.message);
                 return res.send(`id_list_message=t-נמצא ${approvedTitle} אך אירעה שגיאה בטעינת הקובץ&go_to_folder=/`);
             }
         }
 
+        // --- עדיפות 2: אם המשתמש הקיש בחירה בתפריט (1, 2, 3 או 4) ---
+        // בדיקה זו רצה לפני RecordName כדי למנוע את הלולאה שבה ימות המשיח שולחת שוב את RecordName מהשלב הקודם!
+        if (menuChoice) {
+            if (menuChoice === '1') {
+                await ensurePlayfileExtension(musicExtFolder);
+                return res.send(`go_to_folder=/${musicExtFolder}`);
+            }
+            if (menuChoice === '2') {
+                await ensurePlayfileExtension(torahExtFolder);
+                return res.send(`go_to_folder=/${torahExtFolder}`);
+            }
+            if (menuChoice === '3') {
+                const recNum = await getNextFileNumberStr(tempRecFolder, 1);
+                return res.send(`read=t-אנא אמרו את שם השיר המבוקש ובסיום הקישו סולמית=SearchMusic,no,record,/${tempRecFolder},${recNum},no,7,1`);
+            }
+            if (menuChoice === '4') {
+                const recNum = await getNextFileNumberStr(tempRecFolder, 1);
+                return res.send(`read=t-אנא אמרו את שם השיעור המבוקש ובסיום הקישו סולמית=SearchTorah,no,record,/${tempRecFolder},${recNum},no,7,1`);
+            }
+            return res.send(`id_list_message=t-בחירה שגויה&read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,1,7,Digits,no`);
+        }
+
+        // --- עדיפות 3: טיפול בהקלטת שם של משתמש חדש (רק אם טרם נבחרה שלוחה בתפריט) ---
+        if (recordName) {
+            let audioBuf;
+            try {
+                audioBuf = await downloadRecordingFromYemot(recordName, lastVal(q.ApiExtension));
+            } catch (dlErr) {
+                return res.send('id_list_message=t-שגיאה בקליטת ההקלטה אנא נסו שנית&go_to_folder=/');
+            }
+
+            let rawName = '';
+            try {
+                rawName = await transcribeAudio(audioBuf.toString('base64'));
+            } catch (e) {}
+            const cleanName = rawName.replace(/[^א-תa-zA-Z0-9\s]/g, ' ').trim().replace(/\s+/g, ' ') || 'משתמש רשום';
+
+            await uploadWavBufferToExactPath(audioBuf, `ivr2:/${userFolder}/name.wav`, 'name.wav');
+            await uploadTextToExactPath(cleanName, `ivr2:/${userFolder}/name.txt`, 'name.txt');
+            userNamesCache.set(callerPhone, cleanName);
+
+            await ensurePlayfileExtension(musicExtFolder);
+            await ensurePlayfileExtension(torahExtFolder);
+
+            saveAdminLogToExt8(callerPhone, cleanName, 'רישום למערכת', 'הקלטת שם משתמש', '', 'נרשם בהצלחה');
+
+            return res.send(`id_list_message=t-שלום ${cleanName} נרשמתם בהצלחה&read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,1,7,Digits,no`);
+        }
+
+        // --- עדיפות 4: כניסה ראשונית לשלוחה (בדיקה אם המשתמש רשום) ---
+        const registeredName = await getUserNameIfRegistered(callerPhone);
+        if (!registeredName) {
+            return res.send(`read=t-ברוכים הבאים אנא הקליטו את שמכם המלא ובסיום הקישו סולמית=RecordName,no,record,/${tempRecFolder},name_rec,no,7,1`);
+        }
+
+        // משתמש רשום -> השמעת התפריט המבוקש
+        return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,1,7,Digits,no`);
+
     } catch (e) {
-        console.error('[General Error v13.0]', e.message);
+        console.error('[General Error v14.0]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -745,4 +777,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Server v13.0 Ready on port ${port} ===`));
+app.listen(port, () => console.log(`=== Server v14.0 Ready on port ${port} ===`));
