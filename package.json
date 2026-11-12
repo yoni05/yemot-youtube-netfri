@@ -1,6 +1,6 @@
 {
   "name": "yemot-youtube-netfri",
-  "version": "19.0.0",
+  "version": "20.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
