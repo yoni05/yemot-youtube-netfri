@@ -23,7 +23,6 @@ const folderCounters = {};
 const userNamesCache = new Map();
 const configuredPlayfileDirs = new Set();
 
-// חילוץ הערך האחרון אם ימות המשיח שולחת מערך של פרמטרים (כמו ["3","3"])
 function lastVal(param) {
     if (Array.isArray(param)) {
         return String(param[param.length - 1] || '').trim();
@@ -44,24 +43,37 @@ async function fetchWithTimeout(url, options = {}, timeout = 20000) {
     }
 }
 
-// בדיקת סטטוס סרטון מול נטפרי
-async function isVideoApprovedByNetFree(videoId) {
-    try {
-        const url = `https://public.netfree.link/api/check-video?v=${encodeURIComponent(videoId)}`;
-        const res = await fetchWithTimeout(url, {
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-        }, 6000);
-        if (res.ok) {
-            const data = await res.json();
-            if (data && (data.status === 'open' || data.status === 'approved' || data.open === true || data.isBlocked === false)) {
-                return true;
+// בדיקה האם הסרטון קיים ומאושר באתר Netube
+async function isVideoOnNetube(videoId) {
+    const urlsToTry = [
+        `https://netube.co.il/watch?v=${encodeURIComponent(videoId)}`,
+        `https://netube.co.il/v/${encodeURIComponent(videoId)}`,
+        `https://netube.co.il/?s=${encodeURIComponent(videoId)}`
+    ];
+
+    for (const url of urlsToTry) {
+        try {
+            const res = await fetchWithTimeout(url, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                }
+            }, 6000);
+
+            if (res.ok) {
+                const html = await res.text();
+                const hasErrorText = html.includes('הדף לא נמצא') || html.includes('סרטון לא נמצא') || html.includes('אינו זמין') || html.includes('Page not found');
+                // מוודאים שהעמוד תקין ומכיל את מזהה הסרטון כחלק מתוכן העמוד או הנגן
+                if (!hasErrorText && html.includes(videoId)) {
+                    console.log(`[Netube Check] Approved via ${url}`);
+                    return true;
+                }
             }
+        } catch (e) {
+            console.warn(`[Netube Check Warning] ${url}:`, e.message);
         }
-        return false;
-    } catch (e) {
-        console.error('[NetFree Check Error]', e.message);
-        return false;
     }
+    return false;
 }
 
 // בדיקה אם משתמש כבר רשום במערכת
@@ -459,12 +471,11 @@ async function downloadStreamFastToLocalFile(streamUrl, targetFilePath, maxBytes
     }
 }
 
-// הורדה להשמעה מיידית בחיפוש + העברה ברקע לשלוחה האישית (1 או 2) בסדר הפוך כדי שיושמע כסדרו בשלוחת השמעת קבצים רגילה
+// הורדה להשמעה מיידית בחיפוש + העברה ברקע לשלוחה האישית (1 או 2) בסדר הפוך
 async function downloadAndUploadChainedAndArchive(videoId, livePlayFolder, archiveUserFolder, title) {
     const cleanLive = String(livePlayFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
     const cleanArchive = String(archiveUserFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
 
-    // שריון 4 חלקים להשמעה המיידית בחיפוש
     const partNums = await getNextFileNumberStr(cleanLive, 4);
     const partPaths = partNums.map(num => `ivr2:/${cleanLive}/${num}.wav`);
     const partCmds = partNums.map(num => `f-/${cleanLive}/${num}`);
@@ -510,14 +521,12 @@ async function downloadAndUploadChainedAndArchive(videoId, livePlayFolder, archi
             await convertSegmentToWavFast(tmpQuickInput, tmpQuickWav, 0, 900);
         }
 
-        // העלאת החלק הראשון להשמעה המיידית בחיפוש
         const quickWavBuf = await fs.promises.readFile(tmpQuickWav);
         await uploadWavBufferToExactPath(quickWavBuf, partPaths[0], `${partNums[0]}.wav`, 20000);
 
         fs.promises.unlink(tmpQuickInput).catch(() => null);
         fs.promises.unlink(tmpQuickWav).catch(() => null);
 
-        // תהליך רקע: הורדת המשך הקובץ + העלאת כל החלקים לשלוחה האישית (1 או 2) בסדר הפוך
         (async () => {
             const tmpFullIn = path.join(os.tmpdir(), `full_in_${videoId}_${Date.now()}.audio`);
             const allPartsForArchive = [
@@ -580,7 +589,6 @@ async function downloadAndUploadChainedAndArchive(videoId, livePlayFolder, archi
                 fs.promises.unlink(tmpFullIn).catch(() => null);
             }
 
-            // העלאת כל החלקים לשלוחה האישית (שלוחה 1 או 2) בסדר הפוך כך שיושמעו מהתחלה לסוף בשלוחת השמעת קבצים רגילה
             try {
                 await ensurePlayfileExtension(cleanArchive);
                 const rawArchNums = await getNextFileNumberStr(cleanArchive, allPartsForArchive.length);
@@ -610,7 +618,7 @@ async function downloadAndUploadChainedAndArchive(videoId, livePlayFolder, archi
 
 const MAIN_MENU_TEXT = 'לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4 שימו לב כי הקבצים מתעדכנים בשלוחה אחת ושתים רק לאחר כחצי דקה משמיעת הקובץ בחיפוש לפי אורך הקובץ';
 
-app.get('/', (req, res) => { res.send('YouTube Personal Line Server v14.0 (Fixed Loop & External Ext 1/2) OK'); });
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v15.0 (Netube Verified & External Ext 1/2) OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -633,7 +641,6 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
         const userFolder = `users/${callerPhone}`;
         const tempRecFolder = `users/${callerPhone}/temp`;
-        // שלוחות 1 ו-2 הרגילות בימות המשיח (לכל מאזין תת-תיקייה לפי מספר הטלפון שלו בתוך שלוחה 1 ו-2)
         const musicExtFolder = `1/${callerPhone}`;
         const torahExtFolder = `2/${callerPhone}`;
 
@@ -666,7 +673,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             }
 
             const finalQuery = `${cleanQuery} ${categoryFilter}`;
-            const ytUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(finalQuery)}&type=video&maxResults=5&key=${YT_KEY}`;
+            const ytUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(finalQuery)}&type=video&maxResults=6&key=${YT_KEY}`;
             const ytRes = await fetchWithTimeout(ytUrl, {}, 8000);
             const ytData = await ytRes.json();
 
@@ -679,14 +686,14 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
                 return res.send(`id_list_message=t-לא נמצאו תוצאות עבור ${cleanQuery}&go_to_folder=/`);
             }
 
-            // בדיקת התוצאות מול סינון נטפרי
+            // בדיקת התוצאות מול אתר Netube
             let approvedVideoId = null;
             let approvedTitle = '';
 
             for (const item of ytData.items) {
                 const vid = item.id && item.id.videoId;
                 if (!vid) continue;
-                const isApproved = await isVideoApprovedByNetFree(vid);
+                const isApproved = await isVideoOnNetube(vid);
                 if (isApproved) {
                     approvedVideoId = vid;
                     approvedTitle = (item.snippet.title || '').replace(/[^א-תa-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -695,7 +702,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             }
 
             if (!approvedVideoId) {
-                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'נחסם - לא מאושר בנטפרי');
+                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'נחסם - לא מופיע ב-Netube');
                 return res.send('id_list_message=t-הסרטון אינו נמצא יתכן שחיפשתם תוכן שאינו ראוי שימו לב לאחר כמה נסיונות לתוכן כזה תיחסמו מהמערכת&go_to_folder=/');
             }
 
@@ -711,7 +718,6 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         }
 
         // --- עדיפות 2: אם המשתמש הקיש בחירה בתפריט (1, 2, 3 או 4) ---
-        // בדיקה זו רצה לפני RecordName כדי למנוע את הלולאה שבה ימות המשיח שולחת שוב את RecordName מהשלב הקודם!
         if (menuChoice) {
             if (menuChoice === '1') {
                 await ensurePlayfileExtension(musicExtFolder);
@@ -765,11 +771,10 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             return res.send(`read=t-ברוכים הבאים אנא הקליטו את שמכם המלא ובסיום הקישו סולמית=RecordName,no,record,/${tempRecFolder},name_rec,no,7,1`);
         }
 
-        // משתמש רשום -> השמעת התפריט המבוקש
         return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,1,7,Digits,no`);
 
     } catch (e) {
-        console.error('[General Error v14.0]', e.message);
+        console.error('[General Error v15.0]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -777,4 +782,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Server v14.0 Ready on port ${port} ===`));
+app.listen(port, () => console.log(`=== Server v15.0 Ready on port ${port} ===`));
