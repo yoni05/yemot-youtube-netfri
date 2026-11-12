@@ -43,94 +43,37 @@ async function fetchWithTimeout(url, options = {}, timeout = 20000) {
     }
 }
 
-// רשימת מילים חסומות קפדנית לסינון תוכן שאינו ראוי
-const FORBIDDEN_WORDS = [
-    'קליפ רשמי', 'טלוויזיה', 'סדרה', 'פרק מלא', 'כדורגל', 'כדורסל', 'ספורט',
-    'דוגמנית', 'רומנטי', 'אהבה', 'נשים', 'שירת נשים', 'זמרת', 'להקת בנות',
-    'ביקיני', 'חוף', 'מועדון', 'מסיבה', 'טראנס', 'ראפ', 'היפ הופ', 'פופ',
-    'אקס פקטור', 'הכוכב הבא', 'דה וויס', 'אירוויזיון', 'נטפליקס', 'קולנוע',
-    'סרט', 'טריילר', 'גיימינג', 'פורטנייט', 'טיקטוק', 'אינסטגרם', 'אח הגדול',
-    'הישרדות', 'מירוץ למיליון', 'סטנדאפ', 'בדיחות', 'פרודיה', 'מתיחה'
-];
-
-// מילות מפתח תורניות מאושרות לשיעורי תורה
-const TORAH_APPROVED_KEYWORDS = [
-    'הרב', 'רבנו', 'שיעור', 'תורה', 'הלכה', 'פרשת', 'פרשה', 'גמרא', 'דף היומי',
-    'משנה', 'זוהר', 'קבלה', 'מוסר', 'אמונה', 'ביטחון', 'תפילה', 'שבת', 'חג',
-    'מועד', 'כשרות', 'טהרה', 'שלום בית', 'חינוך', 'ישיבת', 'ישיבה', 'כולל',
-    'בית מדרש', 'דרשה', 'שיחה', 'הילולא', 'צדיק', 'אדמו"ר', 'אדמור', 'חסידות',
-    'תניא', 'ליקוטי', 'תהילים', 'נביא', 'חומש', 'בראשית', 'שמות', 'ויקרא',
-    'במדבר', 'דברים', 'הידברות', 'קול הלשון', 'ערוץ מאיר', 'שופר', 'אורות',
-    'יביע אומר', 'חזון עובדיה', 'מוסדות', 'תשובה', 'סליחות', 'אלול', 'פסח',
-    'סוכות', 'שבועות', 'פורים', 'חנוכה', 'ראש השנה', 'יום כיפור'
-];
-
-// מילות מפתח מאושרות למוזיקה חרדית / חסידית / קודש
-const MUSIC_APPROVED_KEYWORDS = [
-    'ניגון', 'ניגוני', 'חסידי', 'חסידית', 'קודש', 'שבת', 'זמירות', 'פיוט',
-    'פיוטים', 'בקשות', 'סליחות', 'קומזיץ', 'הלל', 'רגש', 'נשמה', 'תפילה',
-    'מקהלת', 'מקהלה', 'מלכות', 'נרננה', 'ידידים', 'שירה', 'בעלזא', 'ויזניץ',
-    'גור', 'חב"ד', 'חבד', 'ברסלב', 'סאטמר', 'קרלין', 'מודזיץ', 'ישיביש',
-    'ווקאלי', 'אקפלה', 'הארציג', 'שמחה', 'חתונה', 'הקפות', 'פורים', 'פסח',
-    'מוטי שטיינמץ', 'אברהם פריד', 'מרדכי בן דוד', 'ישי ריבו', 'נפתלי קמפה',
-    'זאנוויל', 'אהרלה סאמט', 'מאיר אדלר', 'פינקי וובר', 'משה גולדמן', 'בנצי שטיין',
-    'שמילי אונגר', 'לוי פאלקאוויטש', 'ליפא שמעלצר', 'אייזיק האניג', 'יוסלה רוזנבלט',
-    'משה קוסביצקי', 'חזנות', 'חזן', 'קול חי מיוזיק', 'קול ברמה', 'טוקר'
-];
-
-// בדיקה משולבת: גם מול Netube וגם מסנן כשרות חכם לכותרת ולערוץ
-async function isVideoApproved(item, isMusic, userQuery) {
-    const vid = item.id && item.id.videoId;
-    if (!vid) return false;
-
-    const title = String(item.snippet?.title || '');
-    const channelTitle = String(item.snippet?.channelTitle || '');
-    const description = String(item.snippet?.description || '');
-    const combinedText = `${title} ${channelTitle} ${description}`.toLowerCase();
-
-    // 1. בדיקת פסילה מיידית: אם מופיעה מילה אסורה בכותרת או בערוץ - חסום מיד
-    for (const badWord of FORBIDDEN_WORDS) {
-        if (title.includes(badWord) || channelTitle.includes(badWord)) {
-            console.log(`[Filter Check] Blocked video ${vid} ("${title}") due to forbidden word: ${badWord}`);
-            return false;
-        }
-    }
-
-    // 2. ניסיון אימות מול אתר Netube (בדיקת API ובדיקת חיפוש במקביל עם Timeout קצר של 3 שניות)
+// בדיקה האם הסרטון קיים ומאושר באתר Netube (ללא תלות במילות חיפוש)
+async function isVideoOnNetube(videoId) {
+    if (!videoId) return false;
     try {
         const netubeChecks = [
-            fetchWithTimeout(`https://netube.co.il/wp-json/wp/v2/posts?search=${encodeURIComponent(vid)}`, {
+            fetchWithTimeout(`https://netube.co.il/wp-json/wp/v2/posts?search=${encodeURIComponent(videoId)}`, {
                 headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept': 'application/json' }
-            }, 3000),
-            fetchWithTimeout(`https://netube.co.il/?s=${encodeURIComponent(vid)}`, {
+            }, 6000),
+            fetchWithTimeout(`https://netube.co.il/?s=${encodeURIComponent(videoId)}`, {
                 headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept': 'text/html' }
-            }, 3000)
+            }, 6000),
+            fetchWithTimeout(`https://netube.co.il/watch?v=${encodeURIComponent(videoId)}`, {
+                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept': 'text/html' }
+            }, 6000)
         ];
 
         const results = await Promise.allSettled(netubeChecks);
         for (const r of results) {
             if (r.status === 'fulfilled' && r.value && r.value.ok) {
                 const text = await r.value.text();
-                if (text.includes(vid) && !text.includes('לא נמצאו תוצאות') && text !== '[]') {
-                    console.log(`[Filter Check] Approved video ${vid} via Netube direct match!`);
+                // וידוא שהמזהה מופיע ואין הודעת שגיאה המעידה על חסימה
+                if (text.includes(videoId) && !text.includes('לא נמצאו תוצאות') && text !== '[]' && !text.includes('הדף לא נמצא')) {
+                    console.log(`[Filter Check] Approved video ${videoId} via Netube.`);
                     return true;
                 }
             }
         }
     } catch (e) {
-        console.warn('[Netube Check] Direct access skipped/blocked:', e.message);
+        console.warn(`[Netube Check Warning] Video ${videoId}:`, e.message);
     }
-
-    // 3. אימות כשרות תוכן לפי קטגוריה (עבור שרת Render בחו"ל שנחסם ב-Netube)
-    const approvedList = isMusic ? MUSIC_APPROVED_KEYWORDS : TORAH_APPROVED_KEYWORDS;
-    for (const goodWord of approvedList) {
-        if (combinedText.includes(goodWord.toLowerCase())) {
-            console.log(`[Filter Check] Approved video ${vid} ("${title}" | Channel: "${channelTitle}") via kosher keyword: "${goodWord}"`);
-            return true;
-        }
-    }
-
-    console.log(`[Filter Check] Rejected video ${vid} ("${title}" | Channel: "${channelTitle}") - no kosher match found.`);
+    console.log(`[Filter Check] Rejected video ${videoId} - not found/blocked on Netube.`);
     return false;
 }
 
@@ -676,7 +619,7 @@ async function downloadAndUploadChainedAndArchive(videoId, livePlayFolder, archi
 
 const MAIN_MENU_TEXT = 'לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4 שימו לב כי הקבצים מתעדכנים בשלוחה אחת ושתים רק לאחר כחצי דקה משמיעת הקובץ בחיפוש לפי אורך הקובץ';
 
-app.get('/', (req, res) => { res.send('YouTube Personal Line Server v16.0 (Smart Kosher Filter & Netube) OK'); });
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v16.1 (Strict Netube Verification) OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -730,10 +673,8 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
                 return res.send('id_list_message=t-לא הצלחתי לשמוע את הבקשה אנא נסו שנית&go_to_folder=/');
             }
 
-            // אם המשתמש כבר אמר "הרב" או "שיעור", לא נעמיס מילים מיותרות שעלולות לצמצם מדי את החיפוש
-            const alreadyHasTorahWord = !isMusic && (cleanQuery.includes('הרב') || cleanQuery.includes('שיעור') || cleanQuery.includes('פרשת'));
-            const finalQuery = alreadyHasTorahWord ? cleanQuery : `${cleanQuery} ${categoryFilter}`;
-
+            // חיפוש ביוטיוב עם המילוי של הקטגוריה המבוקשת
+            const finalQuery = `${cleanQuery} ${categoryFilter}`;
             const ytUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(finalQuery)}&type=video&maxResults=8&key=${YT_KEY}`;
             const ytRes = await fetchWithTimeout(ytUrl, {}, 8000);
             const ytData = await ytRes.json();
@@ -743,18 +684,18 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             }
 
             if (!ytData.items || ytData.items.length === 0) {
-                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'לא נמצאו תוצאות');
+                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'לא נמצאו תוצאות ביוטיוב');
                 return res.send(`id_list_message=t-לא נמצאו תוצאות עבור ${cleanQuery}&go_to_folder=/`);
             }
 
-            // בדיקת התוצאות במנוע הסינון הכפול (Netube + מסנן כשרות תורני)
+            // אימות מול Netube בלבד
             let approvedVideoId = null;
             let approvedTitle = '';
 
             for (const item of ytData.items) {
                 const vid = item.id && item.id.videoId;
                 if (!vid) continue;
-                const isOk = await isVideoApproved(item, isMusic, cleanQuery);
+                const isOk = await isVideoOnNetube(vid);
                 if (isOk) {
                     approvedVideoId = vid;
                     approvedTitle = (item.snippet.title || '').replace(/[^א-תa-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -763,11 +704,11 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             }
 
             if (!approvedVideoId) {
-                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'נחסם בסינון הכשרות');
+                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'כל התוצאות נחסמו ב-Netube');
                 return res.send('id_list_message=t-הסרטון אינו נמצא יתכן שחיפשתם תוכן שאינו ראוי שימו לב לאחר כמה נסיונות לתוכן כזה תיחסמו מהמערכת&go_to_folder=/');
             }
 
-            // הורדה להשמעה מיידית + העברה ברקע לשלוחה 1 או 2 הרגילות בימות המשיח
+            // הורדה להשמעה מיידית + העברה ברקע לשלוחות הרגילות
             try {
                 const chainedPlayCmd = await downloadAndUploadChainedAndArchive(approvedVideoId, tempRecFolder, archiveFolder, approvedTitle);
                 saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, approvedTitle, `הורד בהצלחה לשלוחה ${archiveFolder}`);
@@ -778,7 +719,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             }
         }
 
-        // --- עדיפות 2: אם המשתמש הקיש בחירה בתפריט (1, 2, 3 או 4) ---
+        // --- עדיפות 2: תפריט ראשי ---
         if (menuChoice) {
             if (menuChoice === '1') {
                 await ensurePlayfileExtension(musicExtFolder);
@@ -835,7 +776,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,1,7,Digits,no`);
 
     } catch (e) {
-        console.error('[General Error v16.0]', e.message);
+        console.error('[General Error v16.1]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -843,4 +784,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Server v16.0 Ready on port ${port} ===`));
+app.listen(port, () => console.log(`=== Server v16.1 Ready on port ${port} ===`));
