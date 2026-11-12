@@ -43,37 +43,102 @@ async function fetchWithTimeout(url, options = {}, timeout = 20000) {
     }
 }
 
-// בדיקה האם הסרטון קיים ומאושר באתר Netube (ללא תלות במילות חיפוש)
-async function isVideoOnNetube(videoId) {
-    if (!videoId) return false;
-    try {
-        const netubeChecks = [
-            fetchWithTimeout(`https://netube.co.il/wp-json/wp/v2/posts?search=${encodeURIComponent(videoId)}`, {
-                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept': 'application/json' }
-            }, 6000),
-            fetchWithTimeout(`https://netube.co.il/?s=${encodeURIComponent(videoId)}`, {
-                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept': 'text/html' }
-            }, 6000),
-            fetchWithTimeout(`https://netube.co.il/watch?v=${encodeURIComponent(videoId)}`, {
-                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept': 'text/html' }
-            }, 6000)
-        ];
+// קריאת תוכן מאתר Netube תוך עקיפת חסימת Cloudflare לשרתי ענן בחו"ל
+async function fetchNetubeUrl(targetUrl, timeoutMs = 6500) {
+    const proxyUrls = [
+        targetUrl,
+        `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
+        `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`
+    ];
 
-        const results = await Promise.allSettled(netubeChecks);
-        for (const r of results) {
-            if (r.status === 'fulfilled' && r.value && r.value.ok) {
-                const text = await r.value.text();
-                // וידוא שהמזהה מופיע ואין הודעת שגיאה המעידה על חסימה
-                if (text.includes(videoId) && !text.includes('לא נמצאו תוצאות') && text !== '[]' && !text.includes('הדף לא נמצא')) {
-                    console.log(`[Filter Check] Approved video ${videoId} via Netube.`);
-                    return true;
+    for (const pUrl of proxyUrls) {
+        try {
+            const res = await fetchWithTimeout(pUrl, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/json,*/*;q=0.8',
+                    'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7'
+                }
+            }, timeoutMs);
+
+            if (res.ok) {
+                const text = await res.text();
+                if (text && text.length > 50 && !text.includes('Just a moment...') && !text.includes('Attention Required!')) {
+                    return text;
                 }
             }
-        }
-    } catch (e) {
-        console.warn(`[Netube Check Warning] Video ${videoId}:`, e.message);
+        } catch (e) {}
     }
-    console.log(`[Filter Check] Rejected video ${videoId} - not found/blocked on Netube.`);
+    return null;
+}
+
+// חילוץ מזהי סרטוני יוטיוב (11 תווים) מתוך קוד HTML או JSON של Netube
+function extractYoutubeIdsFromNetubeContent(content) {
+    if (!content) return [];
+    const ids = new Set();
+    const patterns = [
+        /(?:youtube\.com\/(?:watch\?v=|embed\/|v\/)|youtu\.be\/|ytimg\.com\/vi\/|data-video-id=["']|video_id["']\s*:\s*["']|watch\?v=)([a-zA-Z0-9_-]{11})/g
+    ];
+    for (const reg of patterns) {
+        let m;
+        while ((m = reg.exec(content)) !== null) {
+            if (m[1]) ids.add(m[1]);
+        }
+    }
+    return [...ids];
+}
+
+// שלב א': חיפוש ישיר בתוך אתר Netube לפי שאילתת המשתמש
+async function searchDirectlyOnNetube(query) {
+    const searchUrls = [
+        `https://netube.co.il/wp-json/wp/v2/posts?search=${encodeURIComponent(query)}&per_page=10`,
+        `https://netube.co.il/?s=${encodeURIComponent(query)}`
+    ];
+
+    for (const sUrl of searchUrls) {
+        const content = await fetchNetubeUrl(sUrl, 6500);
+        if (content) {
+            const foundIds = extractYoutubeIdsFromNetubeContent(content);
+            if (foundIds.length > 0) {
+                console.log(`[Netube Direct Search] Found ${foundIds.length} approved video IDs on Netube for "${query}":`, foundIds.join(', '));
+                return foundIds;
+            }
+        }
+    }
+    return [];
+}
+
+// שלב ב': בדיקה פרטנית האם Video ID או כותרת הסרטון קיימים ב-Netube
+async function verifyVideoOnNetube(videoId, videoTitle) {
+    if (!videoId) return false;
+
+    // 1. בדיקה לפי מזהה הסרטון ב-Netube
+    const byIdContent = await fetchNetubeUrl(`https://netube.co.il/?s=${encodeURIComponent(videoId)}`, 5500);
+    if (byIdContent && byIdContent.includes(videoId) && !byIdContent.includes('לא נמצאו תוצאות')) {
+        console.log(`[Filter Check] Approved video ${videoId} via Netube ID search.`);
+        return true;
+    }
+
+    // 2. בדיקה בעמוד הצפייה הישיר של Netube
+    const watchContent = await fetchNetubeUrl(`https://netube.co.il/watch?v=${encodeURIComponent(videoId)}`, 5500);
+    if (watchContent && watchContent.includes(videoId) && !watchContent.includes('הדף לא נמצא') && !watchContent.includes('404')) {
+        console.log(`[Filter Check] Approved video ${videoId} via Netube watch page.`);
+        return true;
+    }
+
+    // 3. בדיקה לפי מילות הכותרת של הסרטון בתוך ה-API של Netube
+    const cleanWords = String(videoTitle || '').replace(/[^א-תa-zA-Z0-9\s]/g, ' ').trim().split(/\s+/).slice(0, 4).join(' ');
+    if (cleanWords.length >= 3) {
+        const byTitleContent = await fetchNetubeUrl(`https://netube.co.il/wp-json/wp/v2/posts?search=${encodeURIComponent(cleanWords)}&per_page=5`, 5500);
+        if (byTitleContent && byTitleContent !== '[]') {
+            if (byTitleContent.includes(videoId)) {
+                console.log(`[Filter Check] Approved video ${videoId} via Netube title+ID match.`);
+                return true;
+            }
+        }
+    }
+
+    console.log(`[Filter Check] Rejected video ${videoId} - not found on Netube.`);
     return false;
 }
 
@@ -619,7 +684,7 @@ async function downloadAndUploadChainedAndArchive(videoId, livePlayFolder, archi
 
 const MAIN_MENU_TEXT = 'לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4 שימו לב כי הקבצים מתעדכנים בשלוחה אחת ושתים רק לאחר כחצי דקה משמיעת הקובץ בחיפוש לפי אורך הקובץ';
 
-app.get('/', (req, res) => { res.send('YouTube Personal Line Server v16.1 (Strict Netube Verification) OK'); });
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v17.0 (Netube Proxy + Direct Search) OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -673,42 +738,60 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
                 return res.send('id_list_message=t-לא הצלחתי לשמוע את הבקשה אנא נסו שנית&go_to_folder=/');
             }
 
-            // חיפוש ביוטיוב עם המילוי של הקטגוריה המבוקשת
-            const finalQuery = `${cleanQuery} ${categoryFilter}`;
-            const ytUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(finalQuery)}&type=video&maxResults=8&key=${YT_KEY}`;
-            const ytRes = await fetchWithTimeout(ytUrl, {}, 8000);
-            const ytData = await ytRes.json();
-
-            if (!ytRes.ok) {
-                return res.send('id_list_message=t-שגיאה במפתח החיפוש&go_to_folder=/');
-            }
-
-            if (!ytData.items || ytData.items.length === 0) {
-                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'לא נמצאו תוצאות ביוטיוב');
-                return res.send(`id_list_message=t-לא נמצאו תוצאות עבור ${cleanQuery}&go_to_folder=/`);
-            }
-
-            // אימות מול Netube בלבד
             let approvedVideoId = null;
-            let approvedTitle = '';
+            let approvedTitle = cleanQuery;
 
-            for (const item of ytData.items) {
-                const vid = item.id && item.id.videoId;
-                if (!vid) continue;
-                const isOk = await isVideoOnNetube(vid);
-                if (isOk) {
-                    approvedVideoId = vid;
-                    approvedTitle = (item.snippet.title || '').replace(/[^א-תa-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-                    break;
+            // שלב א': חיפוש ישיר בתוך מאגר Netube לפי בקשת המשתמש!
+            const netubeDirectIds = await searchDirectlyOnNetube(cleanQuery);
+            if (netubeDirectIds.length > 0) {
+                approvedVideoId = netubeDirectIds[0];
+                // שליפת כותרת הסרטון מיוטיוב עבור הקראה ברורה
+                try {
+                    const infoUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${encodeURIComponent(approvedVideoId)}&key=${YT_KEY}`;
+                    const infoRes = await fetchWithTimeout(infoUrl, {}, 4000);
+                    if (infoRes.ok) {
+                        const infoData = await infoRes.json();
+                        const t = infoData?.items?.[0]?.snippet?.title;
+                        if (t) approvedTitle = t.replace(/[^א-תa-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+                    }
+                } catch (e) {}
+            }
+
+            // שלב ב': אם החיפוש הישיר לא החזיר מזהה, מחפשים ביוטיוב ומאמתים כל תוצאה מול Netube דרך המגשר
+            if (!approvedVideoId) {
+                const finalQuery = `${cleanQuery} ${categoryFilter}`;
+                const ytUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(finalQuery)}&type=video&maxResults=6&key=${YT_KEY}`;
+                const ytRes = await fetchWithTimeout(ytUrl, {}, 8000);
+                const ytData = await ytRes.json();
+
+                if (!ytRes.ok) {
+                    return res.send('id_list_message=t-שגיאה במפתח החיפוש&go_to_folder=/');
+                }
+
+                if (!ytData.items || ytData.items.length === 0) {
+                    saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'לא נמצאו תוצאות');
+                    return res.send(`id_list_message=t-לא נמצאו תוצאות עבור ${cleanQuery}&go_to_folder=/`);
+                }
+
+                for (const item of ytData.items) {
+                    const vid = item.id && item.id.videoId;
+                    if (!vid) continue;
+                    const itemTitle = item.snippet?.title || '';
+                    const isOk = await verifyVideoOnNetube(vid, itemTitle);
+                    if (isOk) {
+                        approvedVideoId = vid;
+                        approvedTitle = itemTitle.replace(/[^א-תa-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+                        break;
+                    }
                 }
             }
 
             if (!approvedVideoId) {
-                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'כל התוצאות נחסמו ב-Netube');
+                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'כל התוצאות נחסמו - לא נמצא ב-Netube');
                 return res.send('id_list_message=t-הסרטון אינו נמצא יתכן שחיפשתם תוכן שאינו ראוי שימו לב לאחר כמה נסיונות לתוכן כזה תיחסמו מהמערכת&go_to_folder=/');
             }
 
-            // הורדה להשמעה מיידית + העברה ברקע לשלוחות הרגילות
+            // הורדה להשמעה מיידית + העברה ברקע לשלוחות 1 ו-2 הרגילות
             try {
                 const chainedPlayCmd = await downloadAndUploadChainedAndArchive(approvedVideoId, tempRecFolder, archiveFolder, approvedTitle);
                 saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, approvedTitle, `הורד בהצלחה לשלוחה ${archiveFolder}`);
@@ -776,7 +859,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,1,7,Digits,no`);
 
     } catch (e) {
-        console.error('[General Error v16.1]', e.message);
+        console.error('[General Error v17.0]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -784,4 +867,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Server v16.1 Ready on port ${port} ===`));
+app.listen(port, () => console.log(`=== Server v17.0 Ready on port ${port} ===`));
