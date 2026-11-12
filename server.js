@@ -45,183 +45,156 @@ async function fetchWithTimeout(url, options = {}, timeout = 20000) {
     }
 }
 
-// שליפת עמוד מ-Netube במקביל (הראשון שמחזיר תשובה תקינה מנצח)
-async function fetchNetubeFastRace(targetUrl, timeoutMs = 5000) {
-    const candidates = [
-        targetUrl,
-        `https://r.jina.ai/${targetUrl}`,
-        `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
-        `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`
-    ];
+// חילוץ מילות מפתח משמעותיות מכותרת הסרטון או הערוץ לצורך אימות שנגן NeTube אכן פתח את הסרטון המבוקש
+function getSignificantTitleTokens(str) {
+    return String(str || '')
+        .replace(/[^א-תa-zA-Z0-9\s]/g, ' ')
+        .split(/\s+/)
+        .map(w => w.trim())
+        .filter(w => w.length >= 3 && !['הרב', 'שיעור', 'פרשת', 'חלק', 'סימן', 'שיר', 'חדש', 'רשמי', 'קליפ'].includes(w));
+}
 
-    const racePromises = candidates.map(async (u) => {
-        const res = await fetchWithTimeout(u, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/json,*/*;q=0.8',
-                'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7'
+// בדיקה ישירה של דף הצפייה ב-NeTube (מזהה אם החלון של הסרטון כמו בתמונה באמת נפתח ונטען ב-NeTube!)
+async function checkVideoOnNeTubeWatchPage(item, timeoutMs = 6500) {
+    const vid = item.id?.videoId;
+    if (!vid) throw new Error('NO_VID');
+
+    const ytTitle = (item.snippet?.title || '').trim();
+    const chTitle = (item.snippet?.channelTitle || '').trim();
+    const chId = item.snippet?.channelId || '';
+    const titleTokens = getSignificantTitleTokens(ytTitle);
+    const chTokens = getSignificantTitleTokens(chTitle);
+
+    // NeTube הוא אתר SPA (Single Page Application) שטוען את חלון הסרטון באמצעות JavaScript.
+    // שירות r.jina.ai מרנדר את הדף בדפדפן אמיתי ומחזיר את הטקסט המרונדר של חלון הצפייה!
+    const watchChecks = [
+        // 1. בדיקת דף הצפייה של הסרטון ב-NeTube דרך דפדפן מרונדר (Jina Reader)
+        (async () => {
+            const url = `https://r.jina.ai/https://netube.co.il/watch?v=${encodeURIComponent(vid)}`;
+            const res = await fetchWithTimeout(url, {
+                headers: {
+                    'X-Wait-For-Selector': 'iframe, video, h1',
+                    'Accept': 'text/plain'
+                }
+            }, timeoutMs);
+            if (!res.ok) throw new Error('JINA_WATCH_HTTP_' + res.status);
+            const text = await res.text();
+
+            // אם הסרטון אינו מאושר או לא קיים ב-NeTube, מופיעה הודעת שגיאה/חסימה או שהכותרת אינה נטענת כלל
+            if (text.includes('לא נמצא') || text.includes('אינו מאושר') || text.includes('חסום') || text.includes('שגיאה בטעינת')) {
+                throw new Error('NETUBE_BLOCKED_TEXT');
             }
-        }, timeoutMs);
 
-        if (!res.ok) throw new Error(`HTTP_${res.status}`);
-        const text = await res.text();
-        if (!text || text.length < 20 || text.includes('Just a moment...') || text.includes('Attention Required!') || text.includes('Access Denied')) {
-            throw new Error('CLOUDFLARE_OR_EMPTY');
-        }
-        return text;
-    });
+            // אימות שחלון הסרטון באמת עלה ב-NeTube:
+            // או שמופיע שם הערוץ + כפתור "הורדה" / "סרטונים נוספים" של נגן NeTube, או שמילים מתוך כותרת הסרטון עלו בדף!
+            const hasNeTubePlayerUI = text.includes('הורדה') || text.includes('סרטונים נוספים');
+            const matchedTitleWords = titleTokens.filter(t => text.includes(t));
+            const matchedChannel = (chTitle.length >= 3 && text.includes(chTitle)) || (chTokens.length > 0 && chTokens.every(t => text.includes(t)));
 
-    try {
-        return await Promise.any(racePromises);
-    } catch (e) {
-        return null;
-    }
-}
+            if (matchedChannel || matchedTitleWords.length >= 2 || (hasNeTubePlayerUI && matchedTitleWords.length >= 1)) {
+                console.log(`[NeTube Watch Verified] Video ${vid} ("${ytTitle}") opened successfully on NeTube!`);
+                return item;
+            }
+            throw new Error('WATCH_PAGE_DID_NOT_RENDER_VIDEO');
+        })(),
 
-// בדיקה קפדנית האם מזהה סרטון מופיע כחלון/נגן/תמונה של יוטיוב בתוך תוכן העמוד (ולא סתם כהד של שורת החיפוש!)
-function hasStrictVideoEmbedInContent(content, videoId) {
-    if (!content || !videoId) return false;
-    const escaped = videoId.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
-    const strictPatterns = [
-        new RegExp(`(?:youtube\\.com\\/(?:watch\\?v=|embed\\/|v\\/)|youtu\\.be\\/|ytimg\\.com\\/vi\\/|data-video-id=["']|video_id["']\\s*:\\s*["'])${escaped}`, 'i')
+        // 2. בדיקת ה-API הפנימי של NeTube / נטפרי עבור מזהה הסרטון או הערוץ
+        (async () => {
+            const apiUrls = [
+                `https://netube.co.il/api/video/${encodeURIComponent(vid)}`,
+                `https://netube.co.il/api/videos/${encodeURIComponent(vid)}`,
+                `https://netube.co.il/api/check?v=${encodeURIComponent(vid)}`,
+                `https://r.jina.ai/https://netube.co.il/channel/${encodeURIComponent(chId)}`
+            ];
+            for (const aUrl of apiUrls) {
+                try {
+                    const r = await fetchWithTimeout(aUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 4000);
+                    if (r.ok) {
+                        const t = await r.text();
+                        if (t && !t.includes('<!DOCTYPE html>') && (t.includes(vid) || (chTitle.length >= 3 && t.includes(chTitle)))) {
+                            if (!t.includes('"blocked":true') && !t.includes('לא נמצא') && !t.includes('404')) {
+                                console.log(`[NeTube API/Channel Verified] Video ${vid} / Channel "${chTitle}" verified via ${aUrl}!`);
+                                return item;
+                            }
+                        }
+                    }
+                } catch (e) {}
+            }
+            throw new Error('DIRECT_API_MISS');
+        })()
     ];
-    return strictPatterns.some(reg => reg.test(content));
+
+    return await Promise.any(watchChecks);
 }
 
-// חילוץ כל מזהי סרטוני היוטיוב המוטמעים באמת בתוך דף של Netube
-function extractEmbeddedVideoIds(content) {
-    if (!content) return new Set();
-    const ids = new Set();
-    const reg = /(?:youtube\.com\/(?:watch\?v=|embed\/|v\/)|youtu\.be\/|ytimg\.com\/vi\/|data-video-id=["']|video_id["']\s*:\s*["'])([a-zA-Z0-9_-]{11})/gi;
-    let m;
-    while ((m = reg.exec(content)) !== null) {
-        if (m[1]) ids.add(m[1]);
-    }
-    return ids;
-}
-
-// אימות מרוץ קפדני: מאשר אך ורק אם נמצא חלון/קישור אמיתי של הסרטון או שהערוץ רשום כפוסט אמיתי ב-Netube
+// חיפוש ואימות במקביל על תוצאות היוטיוב מול NeTube
 async function findFirstApprovedYoutubeItemOnNetube(ytItems, userQuery) {
     if (!ytItems || ytItems.length === 0) return null;
 
-    // 1. בדיקת מטמון של סרטונים וערוצים שכבר אומתו בהצלחה
+    // 1. בדיקת מטמון מהירה
     for (const item of ytItems) {
         const vid = item.id?.videoId;
         const chId = item.snippet?.channelId;
         if (vid && (approvedVideosCache.has(vid) || (chId && approvedChannelsCache.has(chId)))) {
-            console.log(`[Fast Cache Match] Video ${vid} or Channel ${chId} already strictly verified on Netube!`);
+            console.log(`[Fast Cache Match] Video ${vid} or Channel ${chId} already verified on NeTube!`);
             return item;
         }
     }
 
-    const checkTasks = [];
+    const raceTasks = [];
 
-    // משימה א': בדיקה מול ה-WP-JSON הרשמי של Netube לפי שאילתת החיפוש
-    // (ב-WP-JSON חוזר מערך [] ריק אם אין פוסטים מאושרים באתר - אין שם הד של שורת החיפוש!)
-    checkTasks.push((async () => {
-        const jsonStr = await fetchNetubeFastRace(`https://netube.co.il/wp-json/wp/v2/posts?search=${encodeURIComponent(userQuery)}&per_page=10`, 5500);
-        if (!jsonStr) throw new Error('NO_JSON_RESP');
-        let posts;
-        try { posts = JSON.parse(jsonStr); } catch (e) { throw new Error('INVALID_JSON'); }
-        if (!Array.isArray(posts) || posts.length === 0) throw new Error('EMPTY_POSTS_ARRAY');
-
-        const fullJsonText = JSON.stringify(posts);
-        const embeddedIds = extractEmbeddedVideoIds(fullJsonText);
-
-        for (const item of ytItems) {
-            const vid = item.id?.videoId;
-            const chId = item.snippet?.channelId;
-            const chTitle = (item.snippet?.channelTitle || '').trim();
-            if (vid && (embeddedIds.has(vid) || fullJsonText.includes(vid))) {
-                console.log(`[Netube Strict Winner] WP-JSON verified exact Video ID ${vid}!`);
-                approvedVideosCache.add(vid);
-                if (chId) approvedChannelsCache.add(chId);
-                return item;
-            }
-            // בדיקה אם שם הערוץ מופיע בתוך כותרת או תוכן של פוסט מאושר ב-Netube
-            if (chTitle.length >= 4 && posts.some(p => (p.title?.rendered || '').includes(chTitle) || (p.content?.rendered || '').includes(chTitle))) {
-                console.log(`[Netube Strict Winner] WP-JSON verified Channel "${chTitle}" in approved Netube posts!`);
-                if (chId) approvedChannelsCache.add(chId);
+    // א. בדיקת דף הצפייה ב-NeTube עבור 4 הסרטונים הראשונים מיוטיוב במקביל
+    for (const item of ytItems.slice(0, 4)) {
+        raceTasks.push((async () => {
+            const verifiedItem = await checkVideoOnNeTubeWatchPage(item, 6800);
+            if (verifiedItem) {
+                const vid = verifiedItem.id?.videoId;
+                const chId = verifiedItem.snippet?.channelId;
                 if (vid) approvedVideosCache.add(vid);
-                return item;
-            }
-        }
-        throw new Error('NO_STRICT_MATCH_IN_WP_JSON');
-    })());
-
-    // משימה ב': בדיקת דף החיפוש ב-Netube אך ורק עבור מזהי יוטיוב שמוטמעים כנגן/תמונה (לא טקסט חופשי בשורת החיפוש!)
-    checkTasks.push((async () => {
-        const html = await fetchNetubeFastRace(`https://netube.co.il/?s=${encodeURIComponent(userQuery)}`, 5500);
-        if (!html || html.includes('לא נמצאו תוצאות') || html.includes('Nothing Found')) {
-            throw new Error('NO_SEARCH_RESULTS');
-        }
-        const embeddedIds = extractEmbeddedVideoIds(html);
-        if (embeddedIds.size === 0) throw new Error('NO_EMBEDDED_VIDEOS_ON_PAGE');
-
-        for (const item of ytItems) {
-            const vid = item.id?.videoId;
-            const chId = item.snippet?.channelId;
-            if (vid && embeddedIds.has(vid)) {
-                console.log(`[Netube Strict Winner] Found embedded video player/thumbnail for ${vid} on Netube search page!`);
-                approvedVideosCache.add(vid);
                 if (chId) approvedChannelsCache.add(chId);
-                return item;
+                return verifiedItem;
             }
-        }
-        throw new Error('EMBEDDED_IDS_DID_NOT_MATCH_YT_RESULTS');
-    })());
-
-    // משימה ג': בדיקת 3 התוצאות הראשונות מול ה-WP-JSON של Netube לפי מזהה סרטון ולפי שם ערוץ
-    for (const item of ytItems.slice(0, 3)) {
-        const vid = item.id?.videoId;
-        const chId = item.snippet?.channelId;
-        const chTitle = (item.snippet?.channelTitle || '').trim();
-
-        if (vid) {
-            checkTasks.push((async () => {
-                // חיפוש ב-WP-JSON לפי ה-Video ID או בדיקת הטמעה קפדנית בדף
-                const html = await fetchNetubeFastRace(`https://netube.co.il/?s=${encodeURIComponent(vid)}`, 5500);
-                if (html && !html.includes('לא נמצאו תוצאות') && hasStrictVideoEmbedInContent(html, vid)) {
-                    console.log(`[Netube Strict Winner] Verified strict video embed for ID ${vid} on Netube!`);
-                    approvedVideosCache.add(vid);
-                    if (chId) approvedChannelsCache.add(chId);
-                    return item;
-                }
-                throw new Error(`VID_${vid}_NOT_EMBEDDED`);
-            })());
-        }
-
-        if (chTitle.length >= 3) {
-            checkTasks.push((async () => {
-                const jsonStr = await fetchNetubeFastRace(`https://netube.co.il/wp-json/wp/v2/posts?search=${encodeURIComponent(chTitle)}&per_page=5`, 5500);
-                if (!jsonStr) throw new Error('NO_CH_JSON');
-                let posts;
-                try { posts = JSON.parse(jsonStr); } catch (e) { throw new Error('BAD_CH_JSON'); }
-                if (!Array.isArray(posts) || posts.length === 0) throw new Error('CH_EMPTY_POSTS');
-
-                // מוודאים ששם הערוץ באמת מופיע בכותרת או בתוכן של פוסט מאושר ב-Netube
-                const matchedPost = posts.some(p => {
-                    const t = (p.title?.rendered || '');
-                    const c = (p.content?.rendered || '');
-                    return t.includes(chTitle) || c.includes(chTitle) || (chId && c.includes(chId));
-                });
-
-                if (matchedPost) {
-                    console.log(`[Netube Strict Winner] Channel "${chTitle}" strictly verified in Netube database! Approving video ${vid}.`);
-                    if (chId) approvedChannelsCache.add(chId);
-                    if (vid) approvedVideosCache.add(vid);
-                    return item;
-                }
-                throw new Error('CH_NOT_IN_POSTS');
-            })());
-        }
+            throw new Error('ITEM_NOT_VERIFIED');
+        })());
     }
 
+    // ב. בדיקת דף החיפוש המרונדר של NeTube (למקרה שהערוץ או הסרטון מופיעים בתוצאות החיפוש של NeTube)
+    raceTasks.push((async () => {
+        const searchUrls = [
+            `https://r.jina.ai/https://netube.co.il/search?q=${encodeURIComponent(userQuery)}`,
+            `https://r.jina.ai/https://netube.co.il/?s=${encodeURIComponent(userQuery)}`
+        ];
+        for (const sUrl of searchUrls) {
+            try {
+                const res = await fetchWithTimeout(sUrl, { headers: { 'Accept': 'text/plain' } }, 6500);
+                if (!res.ok) continue;
+                const text = await res.text();
+                if (!text || text.includes('לא נמצאו תוצאות')) continue;
+
+                for (const item of ytItems) {
+                    const vid = item.id?.videoId;
+                    const chId = item.snippet?.channelId;
+                    const chTitle = (item.snippet?.channelTitle || '').trim();
+                    const titleTokens = getSignificantTitleTokens(item.snippet?.title || '');
+                    const matchedWords = titleTokens.filter(t => text.includes(t));
+
+                    // מוודאים שהקישור לסרטון או שם הערוץ + מילות הכותרת מופיעים בתוצאות החיפוש של NeTube
+                    if ((vid && text.includes(`watch?v=${vid}`)) || (chTitle.length >= 4 && text.includes(chTitle) && matchedWords.length >= 1) || matchedWords.length >= 3) {
+                        console.log(`[NeTube Search Winner] Verified video ${vid} ("${item.snippet?.title}") on NeTube search!`);
+                        if (vid) approvedVideosCache.add(vid);
+                        if (chId) approvedChannelsCache.add(chId);
+                        return item;
+                    }
+                }
+            } catch (e) {}
+        }
+        throw new Error('SEARCH_PAGE_NO_MATCH');
+    })());
+
     try {
-        const winnerItem = await Promise.any(checkTasks);
-        return winnerItem;
-    } catch (allFailedErr) {
-        console.log(`[Filter Check] STRICT BLOCK: Query "${userQuery}" is NOT on Netube (all strict checks rejected).`);
+        return await Promise.any(raceTasks);
+    } catch (err) {
+        console.log(`[Filter Check] Blocked: None of the YouTube results for "${userQuery}" opened on NeTube.`);
         return null;
     }
 }
@@ -768,7 +741,7 @@ async function downloadAndUploadChainedAndArchive(videoId, livePlayFolder, archi
 
 const MAIN_MENU_TEXT = 'לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4 שימו לב כי הקבצים מתעדכנים בשלוחה אחת ושתים רק לאחר כחצי דקה משמיעת הקובץ בחיפוש לפי אורך הקובץ';
 
-app.get('/', (req, res) => { res.send('YouTube Personal Line Server v19.0 (Strict Netube Embed & WP-JSON Verification) OK'); });
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v20.0 (NeTube SPA Watch Page Renderer) OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -836,11 +809,11 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
                 return res.send(`id_list_message=t-לא נמצאו תוצאות עבור ${cleanQuery}&go_to_folder=/`);
             }
 
-            // שלב ב': אימות קפדני (Strict Mode) מול Netube - מוודא שהסרטון או הערוץ באמת מוטמעים ב-Netube
+            // שלב ב': פתיחת קישור הסרטון ב-NeTube ובדיקה שחלון הצפייה ב-NeTube נטען עם הסרטון/הערוץ
             const approvedItem = await findFirstApprovedYoutubeItemOnNetube(ytData.items, cleanQuery);
 
             if (!approvedItem) {
-                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'נחסם - לא נמצא סרטון או ערוץ ב-Netube');
+                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'נחסם - לא נפתח ב-NeTube');
                 return res.send('id_list_message=t-הסרטון אינו נמצא יתכן שחיפשתם תוכן שאינו ראוי שימו לב לאחר כמה נסיונות לתוכן כזה תיחסמו מהמערכת&go_to_folder=/');
             }
 
@@ -915,7 +888,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,1,7,Digits,no`);
 
     } catch (e) {
-        console.error('[General Error v19.0]', e.message);
+        console.error('[General Error v20.0]', e.message);
         if (!res.headersSent) {
             return res.send('id_list_message=t-אירעה תקלה כללית בשרת&go_to_folder=/');
         }
@@ -923,4 +896,4 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`=== Server v19.0 Ready on port ${port} ===`));
+app.listen(port, () => console.log(`=== Server v20.0 Ready on port ${port} ===`));
